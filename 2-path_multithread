@@ -1,0 +1,286 @@
+#include <iostream>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <fstream>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <unistd.h>
+#define STRIPE_SIZE 9       //RS(6,3)
+#define STRIPE_NUM 1000000
+#define CHUNK_NUM 40000
+#define NODE_NUM 300
+#define PATH2_1	9//路径2故障节点数量相对于路径1节点数量
+#define FAILUREPERCENT 20	//杀死节点数量占比
+#define TIMEOUT1 60     //路径1时间阈值
+#define TIMEOUT2 2      //路径2时间阈值
+#define THREAD_NUM  5  //线程数量
+
+using namespace std;
+
+typedef struct node{
+    int dead = 0;  //失效标志位
+    int failedtime = 0; //已失效时间
+    int chunk[CHUNK_NUM];
+    int stripeofnode[CHUNK_NUM];    //该节点包含的条带序号
+    int stripenum = 0;      //该节点包含的条带数量
+    int cur;    //标记节点中已经分配的chunk数量
+}node;
+
+typedef struct stripe{
+    int cur = 0;    //标记条带中已分配的chunk数量，应用于初始化过程
+    int checked = 0;    //标记此条带是否已经被检查过
+    int indanger = 0;   //高风险条带标志位
+    int nodeid[STRIPE_SIZE] = {0};
+    int chunkid[STRIPE_SIZE] = {0};
+}stripe;
+
+node nodes[NODE_NUM];
+stripe stripes[STRIPE_NUM];
+int T1[NODE_NUM * FAILUREPERCENT / 100];     //路径T1中包含的节点序号
+int T2[NODE_NUM * FAILUREPERCENT / 100];     //路径T2中包含的节点序号
+int tnum1 = 0,tnum2 = 0;    //T1、T2中节点数量
+int cur1 = 0, cur2 = 0;
+int failednodes[NODE_NUM * FAILUREPERCENT / 100];       //保存已杀死的节点序号
+int failednum = 0;      //已杀死的节点数量
+pthread_mutex_t mutex1, mutex2;
+
+/*int random(int max_range = 1){
+	if (max_range == 1) return rand() << 16 | rand();
+	cout << max_range << endl;
+	return (rand() << 16 | rand()) % max_range;
+}*/
+
+int bigRand(int maxi)
+{
+    if (maxi < 0)
+    {
+        maxi = 0;
+    }
+
+    int rand1 = rand() % 10000;
+    int rand2 = rand() % 10000;
+    int randV = (rand1 * 10000 + rand2) % maxi;//改成这样
+
+    int randResult = randV;
+    return randResult;
+}
+
+/*void initialize(){     //随机算法初始化时间复杂度太大
+    FILE* fp = fopen("initialize.dat", "r");
+    if(!fp){
+        cout << "open file failed!" << endl;
+    }
+    fread(nodes, sizeof(nodes), 1, fp);
+    fread(stripes, sizeof(stripes), 1, fp);
+    fclose(fp);
+    return;
+}*/
+
+void initialize(){
+    for(int i = 0; i < STRIPE_NUM; i++){
+        for(int j = 0; j < STRIPE_SIZE; j++){
+            int nid = bigRand(NODE_NUM);
+            while(nodes[nid].cur >= CHUNK_NUM){
+                nid = bigRand(NODE_NUM);
+            }
+            nodes[nid].stripeofnode[nodes[nid].stripenum++] = i;
+            stripes[i].nodeid[j] = nid;
+            stripes[i].chunkid[j] = nodes[nid].cur;
+            nodes[nid].cur++;
+        }
+    }
+    return;
+}
+
+/*void initialize(){        //采用平均分配进行初始化，不会影响算法性能的测算
+    int totalorder = 0;
+    int stripeorder = 0;
+    for(int j = 0; j < CHUNK_NUM; j++){
+        for(int i = 0; i < NODE_NUM; i++){
+            stripeorder = totalorder % STRIPE_NUM;
+            int current = stripes[stripeorder].cur;
+            stripes[stripeorder].nodeid[current] = i;
+            stripes[stripeorder].chunkid[current] = j;
+            stripes[stripeorder].cur++;
+            totalorder++;
+            nodes[i].stripeofnode[(nodes[i].stripenum)++] = stripeorder;
+        }
+        //printf("%d %d\n", stripeorder, totalorder);
+    }
+    memset(failednodes, 0 , sizeof(failednodes));
+    memset(T1, 0, sizeof(T1));
+    memset(T2, 0, sizeof(T2));
+    return;
+}*/
+
+void randfailure(){
+    int failurenum = NODE_NUM * FAILUREPERCENT / 100;
+    //srand((int)time(0));
+    for(int i = 0;  i < failurenum * PATH2_1 / (PATH2_1 + 1); i++){
+        int cur = rand() % NODE_NUM;
+        /*if(nodes[cur].dead) i--;
+        else{
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+        }*/
+        if(!nodes[cur].dead){
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+            nodes[cur].failedtime = TIMEOUT2 + 1;
+        }
+    }
+    for(int i = 0;  i < failurenum  / (PATH2_1 + 1); i++){
+        int cur = rand() % NODE_NUM;
+        /*if(nodes[cur].dead) i--;
+        else{
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+        }*/
+        if(!nodes[cur].dead){
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+            nodes[cur].failedtime = TIMEOUT1 + 1;
+        }
+    }
+}
+void* CriticalSection1(void* arg)
+{
+    int curtmp1 = 0, tnumtmp1 = 0;
+    while(1){
+        pthread_mutex_lock(&mutex1);     //进入对tnum1操作的临界区
+        curtmp1 = cur1;     //取出将要处理的节点序号
+        tnumtmp1 = tnum1;
+        if(tnumtmp1 > 0 && curtmp1 < tnumtmp1){
+            cur1++;
+        }
+        pthread_mutex_unlock(&mutex1);     //进入对tnum1操作的临界区
+        if(tnumtmp1 > 0 && curtmp1 < tnumtmp1){     //当待处理节点数大于0且已处理节点数小于待处理节点数时，该线程开始处理游标所指节点
+            //cout << "in1: " << tnum1 << " " << cur1 <<endl;
+            if(nodes[T1[curtmp1]].failedtime >= TIMEOUT1){
+                int stripenum = nodes[T1[curtmp1]].stripenum;
+                for(int j = 0; j < stripenum; j++){
+                    stripes[nodes[T1[curtmp1]].stripeofnode[j]].indanger = 1;
+                    stripes[nodes[T1[curtmp1]].stripeofnode[j]].checked = 1;
+                }
+            }
+
+        }
+        else if(tnumtmp1 > 0 && curtmp1 >= tnumtmp1){
+            return NULL;
+        }
+        else{
+            //sleep(10);
+        }
+    }
+}
+
+void* CriticalSection2(void* arg)
+{
+    int curtmp2 = 0, tnumtmp2 = 0;
+    while(1){
+        pthread_mutex_lock(&mutex2);
+        curtmp2 = cur2;     //取出将要处理的节点序号
+        tnumtmp2 = tnum2;
+        if(tnumtmp2 > 0 && curtmp2 < tnumtmp2){
+            cur2++;
+        }
+        pthread_mutex_unlock(&mutex2);
+        if(tnumtmp2 > 0 && curtmp2 < tnumtmp2){     //当待处理节点数大于0且已处理节点数小于待处理节点数时，该线程开始处理游标所指节点
+            //cout << "in2: " << tnum2 << " " << cur2 <<endl;
+            if(nodes[T2[curtmp2]].failedtime >= TIMEOUT2){
+                int stripenum = nodes[T2[curtmp2]].stripenum;
+                for(int j = 0; j < stripenum; j++){
+                    int stripeid = nodes[T2[curtmp2]].stripeofnode[j];
+                    int failcnt = 0;
+                    int indanger_tmp = 0;
+                    for(int k = 0; k < STRIPE_SIZE; k++){
+                        if(nodes[stripes[stripeid].nodeid[k]].failedtime >= TIMEOUT2){    //原算法是在节点列表中查询是否包含该结点，此处直接获取失效时间
+                            failcnt++;
+                            indanger_tmp |= 1 << k;
+                        }
+                        if(failcnt >= 2){
+                            stripes[stripeid].indanger = indanger_tmp;
+                        }
+                    }
+                }
+            }
+        }
+        else if(tnumtmp2 > 0 && curtmp2 >= tnumtmp2){
+            return NULL;
+        }
+        else{
+            //sleep(10);
+        }
+    }
+}
+
+void clearchecked()
+{
+    for(int i = 0; i < STRIPE_NUM; i++)
+    {
+        stripes[i].checked = 0;
+    }
+    return;
+}
+
+int main()
+{
+    srand(0);
+    initialize();   //初始化
+    /*for(int i = 0; i < NODE_NUM; i++){
+        cout << nodes[i].cur << endl;
+    }*/
+    int cnt = 0, cnt2 = 0;
+    randfailure();
+    pthread_mutex_init(&mutex2, NULL);    //初始化临界区
+    pthread_mutex_init(&mutex2, NULL);
+    //HANDLE ht1[THREAD_NUM];
+    //HANDLE ht2[THREAD_NUM];
+    pthread_t ht1[THREAD_NUM];
+    pthread_t ht2[THREAD_NUM];
+    for(int i = 0; i < THREAD_NUM; i++)
+    {
+        int rc1 = 0, rc2 = 0;
+        rc1 = pthread_create(&ht1[i], NULL, CriticalSection1, NULL);
+        rc2 = pthread_create(&ht2[i], NULL, CriticalSection2, NULL);
+        if(rc1 != 0 || rc2 != 0){
+            cout << "error" << endl;
+        }
+    }
+    pthread_mutex_lock(&mutex1);     //进入对tnum1操作的临界区
+    pthread_mutex_lock(&mutex2);     //进入对tnum2操作的临界区
+    for(int i = 0; i < failednum; i++){     //路径划分
+        if(nodes[failednodes[i]].failedtime >= TIMEOUT1){
+            T1[tnum1++] = failednodes[i];
+        }
+        if(nodes[failednodes[i]].failedtime >= TIMEOUT2){
+            T2[tnum2++] = failednodes[i];
+        }
+    }
+    pthread_mutex_unlock(&mutex1);     //退出对tnum1操作的临界区
+    pthread_mutex_unlock(&mutex2);     //退出对tnum2操作的临界区
+    cout << tnum1 << " " << tnum2 << endl;
+    cnt = 0;
+    struct timeval start, ending;
+    gettimeofday(&start, NULL);
+    for(int i = 0; i < THREAD_NUM; i++){
+        if(PATH2_1 < 1000) pthread_join(ht1[i],NULL);
+        pthread_join(ht2[i],NULL);
+    }
+    gettimeofday(&ending, NULL);
+    float timer;
+    timer = ending.tv_sec - start.tv_sec + (float)(ending.tv_usec - start.tv_usec)/1000000;
+    cout << "improved method v2 cost time:"<< timer << " s" << endl;
+    pthread_mutex_destroy(&mutex1);    //撤销临界区
+    pthread_mutex_destroy(&mutex2);
+    for(int i = 0; i < STRIPE_NUM; i++){
+        if(stripes[i].indanger){
+            cnt++;
+        }
+    }
+    cout << "number of indanger1 stripes: " << cnt << endl;
+    //cout << "number of indanger2 stripes: " << cnt2 << endl;
+    //cout << "number of indanger2 stripes: " << cnt+cnt2 << endl;
+    return 0;
+}
