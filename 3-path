@@ -1,0 +1,304 @@
+#include <iostream>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <unistd.h>
+#define STRIPE_SIZE 9       //RS(6,3)
+#define STRIPE_NUM 1000000
+#define CHUNK_NUM 40000
+#define NODE_NUM 300
+#define PATH2_OCP	60//路径2故(45%)/(70%)障节点占总节点数量
+#define PATH3_OCP   30
+#define PATH1_OCP   10
+#define FAILUREPERCENT 20	//杀死节点数量占比
+#define TIMEOUT1 60     //路径1时间阈值
+#define TIMEOUT2 5      //路径2时间阈值
+#define TIMEOUT3 2
+
+using namespace std;
+
+typedef struct node
+{
+    int dead = 0;  //失效标志位
+    int failedtime = 0; //已失效时间
+    int chunk[CHUNK_NUM];
+    int stripeofnode[CHUNK_NUM];    //该节点包含的条带序号
+    int stripenum = 0;      //该节点包含的条带数量
+    int cur;    //标记节点中已经分配的chunk数量
+} node;
+
+typedef struct stripe
+{
+    int cur = 0;    //标记条带中已分配的chunk数量，应用于初始化过程
+    int checked = 0;    //标记此条带是否已经被检查过
+    int indanger = 0;   //高风险条带标志位
+    int nodeid[STRIPE_SIZE] = {0};
+    int chunkid[STRIPE_SIZE] = {0};
+    //int occur[STRIPE_SIZE] = {0};   //标记条带中的chunk是否已被分配，应用于初始化过程
+} stripe;
+
+node nodes[NODE_NUM];
+stripe stripes[STRIPE_NUM];
+int T1[(int)(NODE_NUM * FAILUREPERCENT) / 100];     //路径T1中包含的节点序号
+int T2[(int)(NODE_NUM * FAILUREPERCENT) / 100];     //路径T2中包含的节点序号
+int T3[(int)(NODE_NUM * FAILUREPERCENT) / 100];     //路径T2中包含的节点序号
+int tnum1 = 0,tnum2 = 0, tnum3 = 0;    //T1、T2中节点数量
+int failednodes[(int)(NODE_NUM * FAILUREPERCENT) / 100];       //保存已杀死的节点序号
+int failednum = 0;      //已杀死的节点数量
+
+/*void initialize(){     //随机算法初始化时间复杂度太大
+    for(int i = 0; i < NODE_NUM; i ++){
+        for(int j = 0; j < CHUNK_NUM; j++){
+            int current = rand() % STRIPE_NUM;
+            while(stripes[current].cur >= STRIPE_SIZE - 1){
+                current = rand() % STRIPE_NUM;float timer;
+    timer = ending.tv_sec - start.tv_sec + (float)(ending.tv_usec - start.tv_usec)/1000000;
+    cout << "improved method v2 cost time:"<< timer << " s" << endl;
+            }
+            int current2 = rand() % STRIPE_SIZE;
+            while(stripes[current].occur[current2]){
+                current2 = rand() % STRIPE_SIZE;
+            }
+            stripes[current].nodeid[current2] = i;
+            stripes[current].chunkid[current2] = j;
+            stripes[current].occur[current2] = 1;
+            stripes[current].cur++;
+            //printf("1\n");
+        }
+        printf("2\n");
+    }
+    return;
+}*/
+
+/*void initialize(){        //采用平均分配进行初始化，不会影响算法性能的测算
+    int totalorder = 0;
+    int stripeorder = 0;
+    for(int j = 0; j < CHUNK_NUM; j++){
+        for(int i = 0; i < NODE_NUM; i++){
+            stripeorder = totalorder % STRIPE_NUM;
+            int current = stripes[stripeorder].cur;
+            stripes[stripeorder].nodeid[current] = i;
+            stripes[stripeorder].chunkid[current] = j;
+            stripes[stripeorder].cur++;
+            totalorder++;
+            nodes[i].stripeofnode[(nodes[i].stripenum)++] = stripeorder;
+        }
+        //printf("%d %d\n", stripeorder, totalorder);
+    }
+    memset(failednodes, 0 , sizeof(failednodes));
+    memset(T1, 0, sizeof(T1));
+    memset(T2, 0, sizeof(T2));
+    return;
+}*/
+
+/*int random(int max_range = 1)
+{
+    if (max_range == 1)
+        return rand() << 16 | rand();
+    return (rand() << 16 | rand()) % max_range;
+}*/
+
+int bigRand(int maxi)
+{
+    if (maxi < 0)
+    {
+        maxi = 0;
+    }
+
+    int rand1 = rand() % 10000;
+    int rand2 = rand() % 10000;
+    int randV = (rand1 * 10000 + rand2) % maxi;//改成这样
+
+    int randResult = randV;
+    return randResult;
+}
+
+/*void initialize(){     //随机算法初始化时间复杂度太大
+    FILE* fp = fopen("initialize.dat", "r");
+    if(!fp){
+        cout << "open file failed!" << endl;
+    }
+    fread(nodes, sizeof(nodes), 1, fp);
+    fread(stripes, sizeof(stripes), 1, fp);
+    fclose(fp);
+    return;
+}*/
+
+void initialize()      //随机算法初始化时间复杂度太大
+{
+    for(int i = 0; i < STRIPE_NUM; i++)
+    {
+        for(int j = 0; j < STRIPE_SIZE; j++)
+        {
+            int nid = bigRand(NODE_NUM);
+            while(nodes[nid].cur >= CHUNK_NUM)
+            {
+                nid = bigRand(NODE_NUM);
+            }
+            nodes[nid].stripeofnode[nodes[nid].stripenum++] = i;
+            stripes[i].nodeid[j] = nid;
+            stripes[i].chunkid[j] = nodes[nid].cur;
+            nodes[nid].cur++;
+        }
+    }
+    return;
+}
+
+void randfailure(){
+    int failurenum = NODE_NUM * FAILUREPERCENT / 100;
+    //srand((int)time(0));
+    for(int i = 0;  i < failurenum * PATH2_OCP / 100; i++){
+        int cur = rand() % NODE_NUM;
+        /*if(nodes[cur].dead) i--;
+        else{
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+        }*/
+        if(!nodes[cur].dead){
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+            nodes[cur].failedtime = TIMEOUT2 + 1;
+        }
+    }
+    for(int i = 0;  i < failurenum * PATH1_OCP / 100; i++){
+        int cur = rand() % NODE_NUM;
+        /*if(nodes[cur].dead) i--;
+        else{
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+        }*/
+        if(!nodes[cur].dead){
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+            nodes[cur].failedtime = TIMEOUT1 + 1;
+        }
+    }
+    for(int i = 0;  i < failurenum * PATH3_OCP / 100; i++){
+        int cur = rand() % NODE_NUM;
+        /*if(nodes[cur].dead) i--;
+        else{
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+        }*/
+        if(!nodes[cur].dead){
+            nodes[cur].dead = 1;
+            failednodes[failednum++] = cur;
+            nodes[cur].failedtime = TIMEOUT3 + 1;
+        }
+    }
+}
+
+void checkindanger1(){
+    for(int i = 0; i < tnum1; i++){
+        if(nodes[T1[i]].failedtime >= TIMEOUT1){
+            int stripenum = nodes[T1[i]].stripenum;
+            for(int j = 0; j < stripenum; j++){
+                stripes[nodes[T1[i]].stripeofnode[j]].indanger = 1;
+            }
+        }
+    }
+    return;
+}
+
+int contains2(int n){
+    for(int i = 0; i < tnum2; i++){
+        if(n == T2[i]) return 1;
+    }
+    return 0;
+}
+
+void checkindanger2(){
+    for(int i = 0; i < tnum2; i++){
+        if(nodes[T2[i]].failedtime >= TIMEOUT2){
+            int stripenum = nodes[T2[i]].stripenum;
+            for(int j = 0; j < stripenum; j++){
+                int stripeid = nodes[T2[i]].stripeofnode[j];
+                int failcnt = 0;
+                int indanger_tmp = 0;
+                for(int k = 0; k < STRIPE_SIZE; k++){
+                    if(contains2(stripes[stripeid].nodeid[k])){    //原算法是在节点列表中查询是否包含该结点，此处直接获取失效时间
+                        failcnt++;
+                        indanger_tmp |= 1 << k;
+                    }
+                    if(failcnt >= 2){
+                        stripes[stripeid].indanger = indanger_tmp;
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+int contains3(int n){
+    for(int i = 0; i < tnum3; i++){
+        if(n == T3[i]) return 1;
+    }
+    return 0;
+}
+
+void checkindanger3(){
+    for(int i = 0; i < tnum3; i++){
+        if(nodes[T3[i]].failedtime >= TIMEOUT3){
+            int stripenum = nodes[T3[i]].stripenum;
+            for(int j = 0; j < stripenum; j++){
+                int stripeid = nodes[T3[i]].stripeofnode[j];
+                int failcnt = 0;
+                int indanger_tmp = 0;
+                for(int k = 0; k < STRIPE_SIZE; k++){
+                    if(contains3(stripes[stripeid].nodeid[k])){    //原算法是在节点列表中查询是否包含该结点，此处直接获取失效时间
+                        failcnt++;
+                        indanger_tmp |= 1 << k;
+                    }
+                    if(failcnt >= 3){
+                        stripes[stripeid].indanger = indanger_tmp;
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+int main()
+{
+    srand(0);
+    initialize();   //初始化
+    randfailure();
+    for(int i = 0; i < failednum; i++)      //路径划分
+    {
+        //cout << "failedtime: " << nodes[failednodes[i]].failedtime << endl;
+        if(nodes[failednodes[i]].failedtime >= TIMEOUT1)
+        {
+            T1[tnum1++] = failednodes[i];
+        }
+        if(nodes[failednodes[i]].failedtime >= TIMEOUT2)
+        {
+            T2[tnum2++] = failednodes[i];
+        }
+        if(nodes[failednodes[i]].failedtime >= TIMEOUT3)
+        {
+            T3[tnum3++] = failednodes[i];
+        }
+    }
+    cout << tnum1 << " " << tnum2 << " " << tnum3<< endl;
+    struct timeval start, ending;
+    gettimeofday(&start, NULL);
+    checkindanger1();
+    checkindanger2();
+    checkindanger3();
+    gettimeofday(&ending, NULL);
+    float timer;
+    timer = ending.tv_sec - start.tv_sec + (float)(ending.tv_usec - start.tv_usec)/1000000;
+    cout << "original method v1 cost time:"<< timer << " s" << endl;
+    //clearchecked();       //由于仅针对已经被判断为indanger的条带置checked标志位，因此每轮之后checked标志位无需重置
+    int cnt = 0;
+    for(int i = 0; i < STRIPE_NUM; i++){
+        if(stripes[i].indanger){
+            cnt++;
+        }
+    }
+    cout << "number of indanger1 stripes1: " << cnt << endl;
+    //cout << "number of indanger2 stripes: " << cnt2 << endl;
+    return 0;
+}
